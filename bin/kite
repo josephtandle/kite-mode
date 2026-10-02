@@ -1,0 +1,599 @@
+#!/usr/bin/env node
+'use strict';
+// kite: the Kite Mode CLI and hook runtime. Node 18+, no dependencies.
+//
+//   kite open "<topic>" [--minutes N] [--doc path] [--energy low|normal]
+//   kite status
+//   kite capture "<text>" [--frame name] [--parent n]
+//   kite frame [name|list]
+//   kite close [--force]
+//   kite morning "<what the morning review confirmed>" [--topic "<topic>"]
+//   kite ledger
+//   kite hook <user-prompt-submit|pre-tool-use|stop>   (used by the hook scripts)
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+
+const HOME = os.homedir();
+
+function expand(p) {
+  if (!p) return p;
+  if (p === '~') return HOME;
+  if (p.startsWith('~/')) return path.join(HOME, p.slice(2));
+  return p;
+}
+
+function kiteHome() {
+  return expand(process.env.KITE_HOME || path.join(HOME, '.kite'));
+}
+const activePath = () => path.join(kiteHome(), 'active.json');
+const ledgerPath = () => path.join(kiteHome(), 'ledger.jsonl');
+
+const FRAMES = {
+  regulator:
+    'Regulator: you write the rules for this space. What would you ban, what would you mandate, and what product appears when everyone has to comply?',
+  'ten-year-old':
+    'Ten-year-old: explain it to a bright ten-year-old. What do they find boring, what do they ask for instead, what would they build out of cardboard and glue?',
+  'zero-budget':
+    'Zero budget: no money, no ads, no hires. What spreads on its own, what can be borrowed, what do people already do that this could ride on?',
+  speedrunner:
+    'Speedrunner: the only goal is the fastest route to the first real user. Skip every step not on that route. Where is the glitch in the level?',
+  'hardware-engineer':
+    'Hardware engineer: it has to be a physical object or a physical ritual. What is the box, the button, the thing that sits on the desk?',
+};
+
+const DENY_MESSAGE = 'Kite window open: that is a morning move, captured it';
+
+// ---------- small helpers ----------
+
+function pad(n) {
+  return String(n).padStart(2, '0');
+}
+function fmtTime(d) {
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+function fmtDate(d) {
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+function fmtDateTime(d) {
+  return `${fmtDate(d)} ${fmtTime(d)}`;
+}
+function slugify(s) {
+  return (
+    String(s)
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 40) || 'window'
+  );
+}
+function ensureDir(p) {
+  fs.mkdirSync(p, { recursive: true });
+}
+function readActive() {
+  try {
+    return JSON.parse(fs.readFileSync(activePath(), 'utf8'));
+  } catch (e) {
+    return null;
+  }
+}
+function writeActive(a) {
+  ensureDir(kiteHome());
+  fs.writeFileSync(activePath(), JSON.stringify(a, null, 2) + '\n');
+}
+function appendLedger(entry) {
+  ensureDir(kiteHome());
+  fs.appendFileSync(ledgerPath(), JSON.stringify(entry) + '\n');
+}
+function readLedger() {
+  try {
+    return fs
+      .readFileSync(ledgerPath(), 'utf8')
+      .split('\n')
+      .filter(Boolean)
+      .map((l) => {
+        try {
+          return JSON.parse(l);
+        } catch (e) {
+          return null;
+        }
+      })
+      .filter(Boolean);
+  } catch (e) {
+    return [];
+  }
+}
+function parseArgs(argv) {
+  const out = { _: [] };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a.startsWith('--')) {
+      const key = a.slice(2);
+      const next = argv[i + 1];
+      if (next !== undefined && !next.startsWith('--')) {
+        out[key] = next;
+        i++;
+      } else {
+        out[key] = true;
+      }
+    } else {
+      out._.push(a);
+    }
+  }
+  return out;
+}
+function fail(msg, code = 1) {
+  process.stderr.write(msg + '\n');
+  process.exit(code);
+}
+
+// ---------- capture doc ----------
+
+function readDoc(doc) {
+  try {
+    return fs.readFileSync(doc, 'utf8');
+  } catch (e) {
+    return '';
+  }
+}
+
+function sectionRange(lines, heading) {
+  const start = lines.findIndex((l) => l.trim().toLowerCase() === heading.toLowerCase());
+  if (start === -1) return null;
+  let end = lines.length;
+  for (let i = start + 1; i < lines.length; i++) {
+    if (/^## /.test(lines[i])) {
+      end = i;
+      break;
+    }
+  }
+  return { start, end };
+}
+
+// Appends one line at the end of a "## Heading" section, creating the section
+// at the end of the doc when it is missing. Never rewrites existing lines.
+function appendToSection(doc, heading, line) {
+  ensureDir(path.dirname(doc));
+  const text = readDoc(doc);
+  const lines = text.length ? text.replace(/\n$/, '').split('\n') : [];
+  let range = sectionRange(lines, heading);
+  if (!range) {
+    if (lines.length && lines[lines.length - 1].trim() !== '') lines.push('');
+    lines.push(heading);
+    range = { start: lines.length - 1, end: lines.length };
+  }
+  const content = lines.slice(range.start + 1, range.end);
+  while (content.length && content[0].trim() === '') content.shift();
+  while (content.length && content[content.length - 1].trim() === '') content.pop();
+  const section = [lines[range.start], '', ...content, line];
+  const rest = lines.slice(range.end);
+  if (rest.length) section.push('');
+  const out = [...lines.slice(0, range.start), ...section, ...rest];
+  fs.writeFileSync(doc, out.join('\n') + '\n');
+}
+
+function ideaLines(doc) {
+  const lines = readDoc(doc).split('\n');
+  const range = sectionRange(lines, '## Ideas');
+  if (!range) return [];
+  return lines.slice(range.start + 1, range.end).filter((l) => /^- \[\d+\]/.test(l));
+}
+function nextIdeaNumber(doc) {
+  let max = 0;
+  for (const l of ideaLines(doc)) {
+    const m = l.match(/^- \[(\d+)\]/);
+    if (m) max = Math.max(max, Number(m[1]));
+  }
+  return max + 1;
+}
+function hasReelIn(doc) {
+  return /^## reel-in\s*$/im.test(readDoc(doc));
+}
+function verdictFromDoc(doc) {
+  const m = readDoc(doc).match(/verdict\s*:?\s*\**\s*(onto something|maybe|it was the altitude)/i);
+  return m ? m[1].toLowerCase() : null;
+}
+
+function docTemplate(a) {
+  return [
+    `# Kite window: ${a.topic}`,
+    '',
+    `Opened: ${fmtDateTime(new Date(a.openedAt))} (local)`,
+    `Ends: ${fmtDateTime(new Date(a.endsAt))} (local)`,
+    `Minutes: ${a.minutes}`,
+    `Energy: ${a.energy}`,
+    'Tether: capture everything, execute nothing. Sends, purchases, deploys, pushes, naming and pricing decisions are morning moves.',
+    '',
+    '## Ideas',
+    '',
+    '## For the reel-in',
+    '',
+    '## Morning moves',
+    '',
+  ].join('\n');
+}
+
+// ---------- commands ----------
+
+const GATE_WORDS = /\b(quick|just|standard|urgent|asap|deadline)\b/i;
+
+function cmdOpen(args) {
+  const topic = (args._[0] || '').trim();
+  if (!topic) fail('usage: kite open "<topic>" [--minutes N] [--doc path] [--energy low|normal]');
+  const existing = readActive();
+  if (existing) fail(`A kite window is already open (topic: ${existing.topic}). Run "kite close" first.`);
+  if (GATE_WORDS.test(topic)) {
+    fail(
+      `Pre-flight gate: "${topic}" reads like a task with a deadline or a quick answer, not an expanded-thinking topic. ` +
+        'Kite Mode is for open questions with time to spare. Rephrase the topic or do the task directly.'
+    );
+  }
+  const energy = args.energy === 'low' ? 'low' : 'normal';
+  let minutes = args.minutes !== undefined ? Number(args.minutes) : energy === 'low' ? 60 : 120;
+  if (!Number.isFinite(minutes) || minutes <= 0) fail('--minutes must be a positive number');
+  minutes = Math.round(minutes);
+  const now = new Date();
+  const ends = new Date(now.getTime() + minutes * 60000);
+  const doc = args.doc
+    ? path.resolve(expand(String(args.doc)))
+    : path.join(kiteHome(), 'windows', `${fmtDate(now)}-${slugify(topic)}.md`);
+  const active = {
+    topic,
+    doc,
+    openedAt: now.toISOString(),
+    endsAt: ends.toISOString(),
+    minutes,
+    energy,
+    strictness: 'tether',
+  };
+  ensureDir(path.dirname(doc));
+  if (!fs.existsSync(doc)) {
+    fs.writeFileSync(doc, docTemplate(active));
+  } else {
+    for (const h of ['## Ideas', '## For the reel-in', '## Morning moves']) {
+      if (!sectionRange(readDoc(doc).split('\n'), h)) appendToSection(doc, h, '');
+    }
+  }
+  writeActive(active);
+  console.log(
+    [
+      `KITE WINDOW OPEN: ${topic}`,
+      `  ends ${fmtTime(ends)} local (${minutes} min, energy ${energy})`,
+      `  capture doc: ${doc}`,
+      '  tether: capture everything, execute nothing. Sends, purchases, deploys, pushes, naming and pricing are morning moves.',
+      '  the first three obvious ideas are banned; evaluation waits for the reel-in.',
+    ].join('\n')
+  );
+}
+
+function minutesLeft(a) {
+  return Math.ceil((new Date(a.endsAt).getTime() - Date.now()) / 60000);
+}
+
+function cmdStatus() {
+  const a = readActive();
+  if (!a) {
+    console.log('No kite window open.');
+    return;
+  }
+  const left = minutesLeft(a);
+  const ideas = ideaLines(a.doc).length;
+  if (left > 0) {
+    console.log(`KITE WINDOW OPEN until ${fmtTime(new Date(a.endsAt))} (${left} min left)`);
+  } else {
+    console.log(`KITE WINDOW ENDED at ${fmtTime(new Date(a.endsAt))} (${-left} min ago): run the reel-in now`);
+  }
+  console.log(`  topic: ${a.topic}`);
+  console.log(`  capture doc: ${a.doc}`);
+  console.log(`  ideas captured: ${ideas}`);
+  console.log(`  reel-in written: ${hasReelIn(a.doc) ? 'yes' : 'no'}`);
+}
+
+function cmdCapture(args) {
+  const a = readActive();
+  if (!a) fail('No kite window open. Run: kite open "<topic>"');
+  const text = (args._[0] || '').trim().replace(/\s*\n\s*/g, ' ').replace(/\|/g, '/');
+  if (!text) fail('usage: kite capture "<idea>" [--frame name] [--parent n]');
+  const frame = args.frame ? String(args.frame) : 'none';
+  const parent = args.parent !== undefined ? String(args.parent) : 'none';
+  const n = nextIdeaNumber(a.doc);
+  appendToSection(a.doc, '## Ideas', `- [${n}] ${text} | frame: ${frame} | parent: ${parent}`);
+  console.log(`[${n}] captured`);
+}
+
+function cmdFrame(args) {
+  const name = args._[0];
+  if (name === 'list') {
+    for (const k of Object.keys(FRAMES)) console.log(k);
+    return;
+  }
+  const keys = Object.keys(FRAMES);
+  const key = name ? keys.find((k) => k === name.toLowerCase()) : keys[Math.floor(Math.random() * keys.length)];
+  if (!key) fail(`Unknown frame "${name}". Frames: ${keys.join(', ')}`);
+  console.log(`frame: ${key}`);
+  console.log(FRAMES[key]);
+}
+
+const REEL_IN_CHECKLIST = [
+  'REEL-IN CHECKLIST (write it under "## Reel-in" in the capture doc):',
+  '  1. Harvest: every idea, name, mechanic and open question is in the doc, not only in chat.',
+  '  2. Score each idea: novelty / viability / fit, 0 to 10 each.',
+  '  3. Cluster by underlying angle, not by keyword.',
+  '  4. Flag traps with a one-line reason each.',
+  '  5. Deepen the top 3: sketch, load-bearing risk, first small move.',
+  '  6. Deferred criticisms from "## For the reel-in" get their hearing.',
+  '  7. Conviction check, one line each: morning, money, wedge, you, source.',
+  '  8. Verdict: onto something / maybe / it was the altitude, plus one sentence why.',
+  '  9. Next morning: at most 3 items, recommended one first, all marked awaiting go.',
+  '  10. "## Morning moves" stays a list. Nothing in it runs until the morning review says so.',
+];
+
+function cmdClose(args) {
+  const a = readActive();
+  if (!a) fail('No kite window open.');
+  console.log(REEL_IN_CHECKLIST.join('\n'));
+  const reelIn = hasReelIn(a.doc);
+  if (!reelIn && !args.force) {
+    fail(
+      `Not closing: ${a.doc} has no "## Reel-in" section yet. Write the reel-in (see docs/capture-format.md), ` +
+        'or pass --force to close without one.'
+    );
+  }
+  const ideaCount = ideaLines(a.doc).length;
+  const verdict = verdictFromDoc(a.doc);
+  const lines = readDoc(a.doc).split('\n');
+  const mm = sectionRange(lines, '## Morning moves');
+  const morningMoves = mm ? lines.slice(mm.start + 1, mm.end).filter((l) => /^- /.test(l)).length : 0;
+  const entry = {
+    type: 'close',
+    closedAt: new Date().toISOString(),
+    openedAt: a.openedAt,
+    topic: a.topic,
+    doc: a.doc,
+    ideaCount,
+    morningMoves,
+    reelIn,
+    verdict,
+    forced: Boolean(args.force),
+  };
+  appendLedger(entry);
+  appendToSection(a.doc, '## Window ledger', `- closed ${fmtDateTime(new Date())}: ${ideaCount} ideas, ${morningMoves} morning moves, verdict: ${verdict || 'none recorded'}${args.force ? ' (closed with --force, no reel-in)' : ''}`);
+  fs.unlinkSync(activePath());
+  console.log('');
+  console.log(`Window closed: ${a.topic}`);
+  console.log(`  ideas: ${ideaCount}, morning moves: ${morningMoves}, verdict: ${verdict || 'none recorded'}`);
+  console.log(`  ledger: ${ledgerPath()}`);
+  console.log('  tomorrow: review the next-morning list, then run: kite morning "<what you confirmed>"');
+}
+
+function cmdMorning(args) {
+  const confirmed = (args._[0] || '').trim();
+  if (!confirmed) fail('usage: kite morning "<what the morning review confirmed>" [--topic "<topic>"]');
+  const closes = readLedger().filter((e) => e.type === 'close');
+  const last = closes[closes.length - 1];
+  const topic = args.topic ? String(args.topic) : last ? last.topic : null;
+  if (!topic) fail('No closed window in the ledger. Pass --topic "<topic>".');
+  appendLedger({
+    type: 'morning',
+    morningAt: new Date().toISOString(),
+    topic,
+    reelInVerdict: last && last.topic === topic ? last.verdict : null,
+    confirmed,
+  });
+  console.log(`Morning review recorded for "${topic}".`);
+}
+
+function cmdLedger() {
+  const entries = readLedger();
+  if (!entries.length) {
+    console.log('Ledger is empty.');
+    return;
+  }
+  const closes = entries.filter((e) => e.type === 'close');
+  const mornings = entries.filter((e) => e.type === 'morning');
+  console.log(`windows closed: ${closes.length}, morning reviews: ${mornings.length}`);
+  const counts = {};
+  for (const c of closes) counts[c.verdict || 'none'] = (counts[c.verdict || 'none'] || 0) + 1;
+  console.log('reel-in verdicts: ' + Object.entries(counts).map(([k, v]) => `${k} ${v}`).join(', '));
+  for (const e of entries.slice(-10)) {
+    if (e.type === 'close') {
+      console.log(`  ${e.closedAt.slice(0, 16)} close    ${e.topic}: ${e.ideaCount} ideas, verdict ${e.verdict || 'none'}`);
+    } else if (e.type === 'morning') {
+      console.log(`  ${e.morningAt.slice(0, 16)} morning  ${e.topic}: ${e.confirmed}`);
+    }
+  }
+}
+
+// ---------- hooks ----------
+
+const READ_ONLY_TOOLS = new Set([
+  'Read', 'Grep', 'Glob', 'LS', 'WebSearch', 'WebFetch',
+  'TodoWrite', 'AskUserQuestion', 'Task', 'Agent', 'Skill', 'ToolSearch', 'BashOutput', 'KillShell',
+]);
+const WRITE_TOOLS = new Set(['Edit', 'Write', 'NotebookEdit', 'MultiEdit']);
+
+const BASH_DENY = [
+  /\bsend\b/i, /\bmail\b/i, /sendmail|mailx/i,
+  /\bcurl\b[^|]*(-X\s*(POST|PUT|PATCH|DELETE)|--data\b|-d\s|--form\b|-F\s|--upload-file\b|-T\s)/i,
+  /\bdeploy/i, /\bvercel\b/i, /\bnetlify\b/i, /npm\s+publish/i, /git\s+push/i, /git\s+commit/i,
+  /\brm\b/i, /\bmv\b/i, /purchase|\bbuy\b|\bcheckout\b/i, /\bstripe\b/i, /wa-send|whatsapp|telegram|twilio/i,
+  /\bssh\b|\bscp\b|\brsync\b/i, /\bsudo\b/i,
+];
+const BASH_ALLOW = new Set([
+  'ls', 'cat', 'grep', 'rg', 'find', 'head', 'tail', 'wc', 'echo', 'printf', 'pwd', 'date', 'which',
+  'stat', 'file', 'du', 'df', 'tree', 'sort', 'uniq', 'cut', 'diff', 'true', 'test', '[', 'kite',
+]);
+const GIT_ALLOW = new Set(['status', 'log', 'diff', 'show', 'branch', 'blame', 'rev-parse', 'ls-files', 'remote']);
+const NODE_EVAL_DENY = /writeFile|appendFile|unlink|rmSync|rmdir|rename|mkdir|child_process|exec|spawn|fetch|http|net\b|dgram|copyFile|truncate|chmod/i;
+
+function bashIsReadOnly(cmd) {
+  if (typeof cmd !== 'string' || !cmd.trim()) return false;
+  for (const re of BASH_DENY) if (re.test(cmd)) return false;
+  let c = cmd.replace(/2>&1/g, ' ').replace(/[12]?>\s*\/dev\/null/g, ' ');
+  if (/>/.test(c)) return false;
+  if (/\$\(|`|<\(/.test(c)) return false;
+  if (/\bxargs\b|\btee\b|-delete\b|-exec\b|\bsed\s+-i|\bperl\b|\bpython3?\b|\bruby\b|\bsh\b|\bbash\b|\bzsh\b|\beval\b|\bsource\b/.test(c)) return false;
+  const segments = c.split(/\|\||&&|;|\|/).map((s) => s.trim()).filter(Boolean);
+  if (!segments.length) return false;
+  for (const seg of segments) {
+    const words = seg.split(/\s+/);
+    let first = words[0];
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(first)) return false;
+    if (first.includes('/') && path.basename(first) !== 'kite') return false;
+    first = path.basename(first);
+    if (first === 'git') {
+      if (!GIT_ALLOW.has(words[1])) return false;
+      if (words[1] === 'branch' && words.slice(2).some((w) => !/^(-a|-r|-v|-vv|--all|--list|--show-current)$/.test(w))) return false;
+      if (words[1] === 'remote' && words.slice(2).some((w) => w !== '-v')) return false;
+      continue;
+    }
+    if (first === 'node') {
+      if (words.some((w) => /\/kite$/.test(w))) continue;
+      const evalFlag = words[1];
+      if (!['-e', '--eval', '-p', '--print'].includes(evalFlag)) return false;
+      if (NODE_EVAL_DENY.test(seg)) return false;
+      continue;
+    }
+    if (!BASH_ALLOW.has(first)) return false;
+  }
+  return true;
+}
+
+function samePath(a, b) {
+  if (!a || !b) return false;
+  const real = (p) => {
+    try {
+      return fs.realpathSync(p);
+    } catch (e) {
+      return path.resolve(p);
+    }
+  };
+  return real(a) === real(b);
+}
+
+function summarizeInput(toolName, input) {
+  let s;
+  if (!input || typeof input !== 'object') s = '';
+  else if (toolName === 'Bash' && typeof input.command === 'string') s = input.command;
+  else if (typeof input.file_path === 'string') s = input.file_path;
+  else if (typeof input.notebook_path === 'string') s = input.notebook_path;
+  else s = JSON.stringify(input);
+  s = String(s).replace(/\s+/g, ' ').trim();
+  return s.length > 200 ? s.slice(0, 197) + '...' : s;
+}
+
+function decideTool(active, toolName, input, cwd) {
+  if (!toolName) return { allow: true };
+  if (READ_ONLY_TOOLS.has(toolName)) return { allow: true };
+  if (WRITE_TOOLS.has(toolName)) {
+    const raw = (input && (input.file_path || input.notebook_path)) || '';
+    const target = raw ? path.resolve(cwd || process.cwd(), expand(String(raw))) : '';
+    return { allow: samePath(target, active.doc) };
+  }
+  if (toolName === 'Bash') return { allow: bashIsReadOnly(input && input.command) };
+  if (/^mcp__/.test(toolName)) {
+    return { allow: /(read|search|get|list|fetch|query|find|describe|status|lookup)/i.test(toolName.split('__').pop() || '') };
+  }
+  return { allow: false };
+}
+
+function readStdin() {
+  try {
+    return fs.readFileSync(0, 'utf8');
+  } catch (e) {
+    return '';
+  }
+}
+
+function hookUserPromptSubmit() {
+  const a = readActive();
+  if (!a) return;
+  const left = minutesLeft(a);
+  if (left > 0) {
+    console.log(
+      `KITE WINDOW OPEN until ${fmtTime(new Date(a.endsAt))} (${left} min left) | topic: ${a.topic} | capture doc: ${a.doc} | capture everything, execute nothing`
+    );
+  } else {
+    console.log(`KITE WINDOW ENDED at ${fmtTime(new Date(a.endsAt))} (topic: ${a.topic}): window ended, run the reel-in now (write "## Reel-in" in ${a.doc}, then kite close)`);
+  }
+}
+
+function hookPreToolUse() {
+  const a = readActive();
+  if (!a) return;
+  let payload = {};
+  try {
+    payload = JSON.parse(readStdin() || '{}');
+  } catch (e) {
+    payload = {};
+  }
+  const toolName = payload.tool_name;
+  const input = payload.tool_input || {};
+  const decision = decideTool(a, toolName, input, payload.cwd);
+  if (decision.allow) return;
+  try {
+    appendToSection(a.doc, '## Morning moves', `- ${fmtTime(new Date())} ${toolName}: ${summarizeInput(toolName, input)}`);
+  } catch (e) {
+    // the denial still stands even if the capture failed; say so
+    process.stderr.write(`(could not append to ${a.doc}: ${e.message})\n`);
+  }
+  process.stderr.write(DENY_MESSAGE + '\n');
+  process.exit(2);
+}
+
+function hookStop() {
+  const a = readActive();
+  if (!a) return;
+  if (minutesLeft(a) > 0) return;
+  console.log(`Kite window ended at ${fmtTime(new Date(a.endsAt))} (topic: ${a.topic}). Run the reel-in now: write "## Reel-in" in ${a.doc}, then kite close.`);
+}
+
+function cmdHook(args) {
+  const which = args._[0];
+  if (which === 'user-prompt-submit') return hookUserPromptSubmit();
+  if (which === 'pre-tool-use') return hookPreToolUse();
+  if (which === 'stop') return hookStop();
+  fail('usage: kite hook <user-prompt-submit|pre-tool-use|stop>');
+}
+
+// ---------- main ----------
+
+const USAGE = `kite: a sanctioned expanded-thinking window with a hard tether
+
+  kite open "<topic>" [--minutes N] [--doc path] [--energy low|normal]
+  kite status
+  kite capture "<idea>" [--frame name] [--parent n]
+  kite frame [name|list]
+  kite close [--force]
+  kite morning "<what the morning review confirmed>" [--topic "<topic>"]
+  kite ledger
+
+State lives in $KITE_HOME (default ~/.kite): active.json, windows/, ledger.jsonl`;
+
+function main(argv) {
+  const [cmd, ...rest] = argv;
+  const args = parseArgs(rest);
+  switch (cmd) {
+    case 'open': return cmdOpen(args);
+    case 'status': return cmdStatus();
+    case 'capture': return cmdCapture(args);
+    case 'frame': return cmdFrame(args);
+    case 'close': return cmdClose(args);
+    case 'morning': return cmdMorning(args);
+    case 'ledger': return cmdLedger();
+    case 'hook': return cmdHook(args);
+    case undefined:
+    case 'help':
+    case '--help':
+    case '-h':
+      console.log(USAGE);
+      return;
+    default:
+      fail(`Unknown command "${cmd}".\n\n${USAGE}`);
+  }
+}
+
+module.exports = { bashIsReadOnly, decideTool, appendToSection, FRAMES };
+
+if (require.main === module) main(process.argv.slice(2));
