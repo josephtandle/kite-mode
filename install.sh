@@ -60,3 +60,13 @@ echo "Codex note: Codex has no hooks, so the hard tether (tool calls denied whil
 echo "is enforced in Claude Code only. In Codex the skill text and the kite CLI still give you the"
 echo "capture discipline, the banner via 'kite status', and the reel-in; nothing stops a tool call there."
 echo "Restart Claude Code so it picks up the new hooks."
+
+# Weekly self-update: on by default, one line turns it off. It fast-forwards
+# this clone from its origin, backs up your own files first and rolls back if
+# the self-test fails.
+echo ""
+if [ "${KITE_MODE_SKIP_UPDATES:-0}" = "1" ]; then
+  echo "Weekly updates not scheduled (KITE_MODE_SKIP_UPDATES=1). Later: node \"$SKILL_DIR/scripts/self-update.js\" --register"
+else
+  node "$SKILL_DIR/scripts/self-update.js" --register || echo "Weekly updates could not be scheduled. Try later: node \"$SKILL_DIR/scripts/self-update.js\" --register"
+fi

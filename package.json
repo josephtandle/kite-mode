@@ -1,0 +1,13 @@
+{
+  "name": "kite-mode",
+  "version": "1.0.0",
+  "description": "Explicit-only idea window: capture everything, execute nothing.",
+  "license": "SEE LICENSE IN LICENSE",
+  "private": true,
+  "bin": { "kite": "bin/kite" },
+  "scripts": {
+    "test": "node --test tests/",
+    "selftest": "node --test tests/kite.test.js"
+  },
+  "engines": { "node": ">=18" }
+}
