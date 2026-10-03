@@ -119,4 +119,4 @@ Shapes and ideas were adapted from these MIT-licensed projects. No text was copi
 
 ## License
 
-MIT, see [LICENSE](LICENSE).
+All Sorted Personal Use License: use it for yourself, never sell or redistribute it. See LICENSE.
